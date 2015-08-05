@@ -132,6 +132,7 @@
 
 extern crate regex;
 extern crate log;
+extern crate chrono;
 
 use regex::Regex;
 use std::io::prelude::*;
@@ -140,9 +141,11 @@ use std::env;
 
 use log::{Log, LogLevel, LogLevelFilter, LogRecord, SetLoggerError, LogMetadata};
 
+use chrono::Local;
+
 struct Logger {
     directives: Vec<LogDirective>,
-    filter: Option<Regex>,
+    filter: Option<Regex>
 }
 
 impl Logger {
@@ -177,10 +180,11 @@ impl Log for Logger {
         }
 
         let _ = writeln!(&mut io::stderr(),
-                         "{}:{}: {}",
-                         record.level(),
-                         record.location().module_path(),
-                         record.args());
+                         "{ts: <36} [{loc: <36}] {level: <7}: {msg}",
+                         ts=Local::now(),
+                         level=record.level(),
+                         loc=record.location().module_path(),
+                         msg=record.args());
     }
 }
 
