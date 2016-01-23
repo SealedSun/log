@@ -59,10 +59,16 @@ fn test(a: &State, filter: LogLevelFilter) {
     last(&a, t(LogLevel::Warn, filter));
     info!("");
     last(&a, t(LogLevel::Info, filter));
+
     debug!("");
-    last(&a, t(LogLevel::Debug, filter));
+    if cfg!(debug_assertions) {
+        last(&a, t(LogLevel::Debug, filter));
+    } else {
+        last(&a, None);
+    }
+
     trace!("");
-    last(&a, t(LogLevel::Trace, filter));
+    last(&a, None);
 
     fn t(lvl: LogLevel, filter: LogLevelFilter) -> Option<LogLevel> {
         if lvl <= filter {Some(lvl)} else {None}

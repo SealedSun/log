@@ -2,20 +2,27 @@ language: rust
 sudo: false
 rust:
   - 1.0.0
+  - stable
   - beta
   - nightly
 script:
   - cargo build --verbose
-  - cargo test --verbose
+  - ([ $TRAVIS_RUST_VERSION != nightly ] || cargo build --verbose --no-default-features)
+  - ([ $TRAVIS_RUST_VERSION != nightly ] || cargo build --verbose --features nightly)
+  - ([ $TRAVIS_RUST_VERSION == 1.0.0 ] || cargo test --verbose)
+  - ([ $TRAVIS_RUST_VERSION != nightly ] || cargo test --verbose --no-default-features)
   - cargo test --verbose --manifest-path env/Cargo.toml
-  - cargo doc --manifest-path env/Cargo.toml
+  - cargo run --verbose --manifest-path tests/max_level_features/Cargo.toml
+  - cargo run --verbose --manifest-path tests/max_level_features/Cargo.toml --release
+  - ([ $TRAVIS_RUST_VERSION != nightly ] || cargo doc --no-deps --features nightly)
+  - CARGO_TARGET_DIR=target cargo doc --no-deps --manifest-path env/Cargo.toml
 after_success: |
   [ $TRAVIS_BRANCH = master ] &&
   [ $TRAVIS_PULL_REQUEST = false ] &&
   [ $TRAVIS_RUST_VERSION = nightly ] &&
-  echo '<meta http-equiv=refresh content=0;url=log/index.html>' > env/target/doc/index.html &&
+  echo '<meta http-equiv=refresh content=0;url=log/index.html>' > target/doc/index.html &&
   pip install ghp-import --user $USER &&
-  $HOME/.local/bin/ghp-import -n env/target/doc &&
+  $HOME/.local/bin/ghp-import -n target/doc &&
   git push -qf https://${TOKEN}@github.com/${TRAVIS_REPO_SLUG}.git gh-pages
 env:
   global:

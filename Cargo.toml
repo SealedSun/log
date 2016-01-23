@@ -1,12 +1,12 @@
 [package]
 
 name = "log"
-version = "0.3.1"
+version = "0.3.5"
 authors = ["The Rust Project Developers"]
 license = "MIT/Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/rust-lang/log"
-documentation = "http://doc.rust-lang.org/log"
+documentation = "https://doc.rust-lang.org/log"
 homepage = "https://github.com/rust-lang/log"
 description = """
 A lightweight logging facade for Rust
@@ -17,4 +17,23 @@ name = "filters"
 harness = false
 
 [dependencies]
-libc = "0.1"
+libc = {version = "0.2", optional = true}
+
+[features]
+max_level_off   = []
+max_level_error = []
+max_level_warn  = []
+max_level_info  = []
+max_level_debug = []
+max_level_trace = []
+
+release_max_level_off   = []
+release_max_level_error = []
+release_max_level_warn  = []
+release_max_level_info  = []
+release_max_level_debug = []
+release_max_level_trace = []
+
+nightly = []
+use_std = ["libc"]
+default = ["use_std"]

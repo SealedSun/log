@@ -63,7 +63,7 @@
 //!
 //! ## In executables
 //!
-//! Executables should chose a logging framework and initialize it early in the
+//! Executables should choose a logging framework and initialize it early in the
 //! runtime of the program. Logging frameworks will typically include a
 //! function to do this. Any log messages generated before the framework is
 //! initialized will be ignored.
@@ -136,6 +136,7 @@
 //! #   fn log(&self, _: &log::LogRecord) {}
 //! # }
 //! # fn main() {}
+//! # #[cfg(feature = "use_std")]
 //! pub fn init() -> Result<(), SetLoggerError> {
 //!     log::set_logger(|max_log_level| {
 //!         max_log_level.set(LogLevelFilter::Info);
@@ -143,50 +144,98 @@
 //!     })
 //! }
 //! ```
+//!
+//! # Use with `no_std`
+//!
+//! To use the `log` crate without depending on `libstd`, you need to specify
+//! `default-features = false` when specifying the dependency in `Cargo.toml`.
+//! This makes no difference to libraries using `log` since the logging API
+//! remains the same. However executables will need to use the `set_logger_raw`
+//! function to initialize a logger and the `shutdown_logger_raw` function to
+//! shut down the global logger before exiting:
+//!
+//! ```rust
+//! # extern crate log;
+//! # use log::{LogLevel, LogLevelFilter, SetLoggerError, ShutdownLoggerError,
+//! #           LogMetadata};
+//! # struct SimpleLogger;
+//! # impl log::Log for SimpleLogger {
+//! #   fn enabled(&self, _: &LogMetadata) -> bool { false }
+//! #   fn log(&self, _: &log::LogRecord) {}
+//! # }
+//! # impl SimpleLogger {
+//! #   fn flush(&self) {}
+//! # }
+//! # fn main() {}
+//! pub fn init() -> Result<(), SetLoggerError> {
+//!     unsafe {
+//!         log::set_logger_raw(|max_log_level| {
+//!             static LOGGER: SimpleLogger = SimpleLogger;
+//!             max_log_level.set(LogLevelFilter::Info);
+//!             &SimpleLogger
+//!         })
+//!     }
+//! }
+//! pub fn shutdown() -> Result<(), ShutdownLoggerError> {
+//!     log::shutdown_logger_raw().map(|logger| {
+//!         let logger = unsafe { &*(logger as *const SimpleLogger) };
+//!         logger.flush();
+//!     })
+//! }
+//! ```
 
-#![doc(html_logo_url = "http://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
-       html_favicon_url = "http://www.rust-lang.org/favicon.ico",
-       html_root_url = "http://doc.rust-lang.org/log/")]
+#![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
+       html_favicon_url = "https://www.rust-lang.org/favicon.ico",
+       html_root_url = "https://doc.rust-lang.org/log/")]
 #![warn(missing_docs)]
+#![cfg_attr(feature = "nightly", feature(panic_handler))]
 
+#![cfg_attr(not(feature = "use_std"), no_std)]
+
+#[cfg(not(feature = "use_std"))]
+extern crate core as std;
+
+#[cfg(feature = "use_std")]
 extern crate libc;
 
-use std::ascii::AsciiExt;
 use std::cmp;
+#[cfg(feature = "use_std")]
 use std::error;
 use std::fmt;
 use std::mem;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
+#[macro_use]
 mod macros;
 
-// The setup here is a bit weird to make at_exit work.
+// The setup here is a bit weird to make shutdown_logger_raw work.
 //
 // There are four different states that we care about: the logger's
 // uninitialized, the logger's initializing (set_logger's been called but
-// LOGGER hasn't actually been set yet), the logger's active, or the logger's
-// shutting down inside of at_exit.
+// LOGGER hasn't actually been set yet), the logger's active, or the logger is
+// shut down after calling shutdown_logger_raw.
 //
-// The LOGGER static is normally a Box<Box<Log>> with some special possible
-// values as well. The uninitialized and initializing states are represented by
-// the values 0 and 1 respectively. The shutting down state is also represented
-// by 1. Any other value is a valid pointer to the logger.
+// The LOGGER static holds a pointer to the global logger. It is protected by
+// the STATE static which determines whether LOGGER has been initialized yet.
 //
-// The at_exit routine needs to make sure that no threads are actively logging
-// when it deallocates the logger. The number of actively logging threads is
-// tracked in the REFCOUNT static. The routine first sets LOGGER back to 1.
-// All logging calls past that point will immediately return without accessing
-// the logger. At that point, the at_exit routine just waits for the refcount
-// to reach 0 before deallocating the logger. Note that the refcount does not
-// necessarily monotonically decrease at this point, as new log calls still
-// increment and decrement it, but the interval in between is small enough that
-// the wait is really just for the active log calls to finish.
-static LOGGER: AtomicUsize = ATOMIC_USIZE_INIT;
+// The shutdown_logger_raw routine needs to make sure that no threads are
+// actively logging before it returns. The number of actively logging threads is
+// tracked in the REFCOUNT static. The routine first sets STATE back to
+// INITIALIZING. All logging calls past that point will immediately return
+// without accessing the logger. At that point, the at_exit routine just waits
+// for the refcount to reach 0 before deallocating the logger. Note that the
+// refcount does not necessarily monotonically decrease at this point, as new
+// log calls still increment and decrement it, but the interval in between is
+// small enough that the wait is really just for the active log calls to finish.
+
+static mut LOGGER: *const Log = &NopLogger;
+static STATE: AtomicUsize = ATOMIC_USIZE_INIT;
 static REFCOUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
 const UNINITIALIZED: usize = 0;
 const INITIALIZING: usize = 1;
+const INITIALIZED: usize = 2;
 
 static MAX_LOG_LEVEL_FILTER: AtomicUsize = ATOMIC_USIZE_INIT;
 
@@ -270,11 +319,30 @@ fn ok_or<T, E>(t: Option<T>, e: E) -> Result<T, E> {
     }
 }
 
+// Reimplemented here because std::ascii is not available in libcore
+fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
+    fn to_ascii_uppercase(c: u8) -> u8 {
+        if c >= b'a' && c <= b'z' {
+            c - b'a' + b'A'
+        } else {
+            c
+        }
+    }
+
+    if a.len() == b.len() {
+        a.bytes()
+         .zip(b.bytes())
+         .all(|(a, b)| to_ascii_uppercase(a) == to_ascii_uppercase(b))
+    } else {
+        false
+    }
+}
+
 impl FromStr for LogLevel {
     type Err = ();
     fn from_str(level: &str) -> Result<LogLevel, ()> {
         ok_or(LOG_LEVEL_NAMES.iter()
-                    .position(|&name| name.eq_ignore_ascii_case(level))
+                    .position(|&name| eq_ignore_ascii_case(name, level))
                     .into_iter()
                     .filter(|&idx| idx != 0)
                     .map(|idx| LogLevel::from_usize(idx).unwrap())
@@ -382,7 +450,7 @@ impl FromStr for LogLevelFilter {
     type Err = ();
     fn from_str(level: &str) -> Result<LogLevelFilter, ()> {
         ok_or(LOG_LEVEL_NAMES.iter()
-                    .position(|&name| name.eq_ignore_ascii_case(level))
+                    .position(|&name| eq_ignore_ascii_case(name, level))
                     .map(|p| LogLevelFilter::from_usize(p).unwrap()), ())
     }
 }
@@ -490,6 +558,15 @@ pub trait Log: Sync+Send {
     fn log(&self, record: &LogRecord);
 }
 
+// Just used as a dummy initial value for LOGGER
+struct NopLogger;
+
+impl Log for NopLogger {
+    fn enabled(&self, _: &LogMetadata) -> bool { false }
+
+    fn log(&self, _: &LogRecord) {}
+}
+
 /// The location of a log message.
 ///
 /// # Warning
@@ -576,31 +653,98 @@ pub fn max_log_level() -> LogLevelFilter {
 /// This function does not typically need to be called manually. Logger
 /// implementations should provide an initialization method that calls
 /// `set_logger` internally.
+///
+/// Requires the `use_std` feature (enabled by default).
+#[cfg(feature = "use_std")]
 pub fn set_logger<M>(make_logger: M) -> Result<(), SetLoggerError>
         where M: FnOnce(MaxLogLevelFilter) -> Box<Log> {
-    if LOGGER.compare_and_swap(UNINITIALIZED, INITIALIZING,
-                               Ordering::SeqCst) != UNINITIALIZED {
+    let result = unsafe {
+        set_logger_raw(|max_level| mem::transmute(make_logger(max_level)))
+    };
+
+    return match result {
+        Ok(()) => {
+            assert_eq!(unsafe { libc::atexit(shutdown) }, 0);
+            Ok(())
+        }
+        Err(_) => Err(SetLoggerError(())),
+    };
+
+    extern fn shutdown() {
+        shutdown_logger_raw().map(|logger| unsafe {
+            mem::transmute::<_, Box<Log>>(logger);
+        }).ok();
+    }
+}
+
+/// Sets the global logger from a raw pointer.
+///
+/// This function is similar to `set_logger` except that it is usable in
+/// `no_std` code. Another difference is that the logger is not automatically
+/// shut down on program exit, and `shutdown_logger_raw` must be called to
+/// manually shut it down.
+///
+/// The `make_logger` closure is passed a `MaxLogLevel` object, which the
+/// logger should use to keep the global maximum log level in sync with the
+/// highest log level that the logger will not ignore.
+///
+/// This function may only be called once in the lifetime of a program. Any log
+/// events that occur before the call to `set_logger_raw` completes will be
+/// ignored.
+///
+/// This function does not typically need to be called manually. Logger
+/// implementations should provide an initialization method that calls
+/// `set_logger_raw` internally.
+///
+/// # Safety
+///
+/// The pointer returned by `make_logger` must remain valid for the entire
+/// duration of the program or until `shutdown_logger_raw` is called.
+pub unsafe fn set_logger_raw<M>(make_logger: M) -> Result<(), SetLoggerError>
+        where M: FnOnce(MaxLogLevelFilter) -> *const Log {
+    if STATE.compare_and_swap(UNINITIALIZED, INITIALIZING,
+                              Ordering::SeqCst) != UNINITIALIZED {
         return Err(SetLoggerError(()));
     }
 
-    let logger = Box::new(make_logger(MaxLogLevelFilter(())));
-    let logger = unsafe { mem::transmute::<Box<Box<Log>>, usize>(logger) };
-    LOGGER.store(logger, Ordering::SeqCst);
+    LOGGER = make_logger(MaxLogLevelFilter(()));
+    STATE.store(INITIALIZED, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Shuts down the global logger.
+///
+/// This function may only be called once in the lifetime of a program, and may
+/// not be called before `set_logger_raw`. Once the global logger has been shut
+/// down, it can no longer be re-initialized by `set_logger_raw`. Any log
+/// events that occur after the call to `shutdown_logger_raw` completes will be
+/// ignored.
+///
+/// The pointer that was originally passed to `set_logger_raw` is returned on
+/// success. At that point it is guaranteed that no other threads are
+/// concurrently accessing the logger object.
+///
+/// This function should not be called when the global logger was registered
+/// using `set_logger`, since in that case the logger will automatically be shut
+/// down when the program exits
+pub fn shutdown_logger_raw() -> Result<*const Log, ShutdownLoggerError> {
+    // Set the global log level to stop other thread from logging
+    MAX_LOG_LEVEL_FILTER.store(0, Ordering::SeqCst);
+
+    // Set to INITIALIZING to prevent re-initialization after
+    if STATE.compare_and_swap(INITIALIZED, INITIALIZING,
+                              Ordering::SeqCst) != INITIALIZED {
+        return Err(ShutdownLoggerError(()));
+    }
+
+    while REFCOUNT.load(Ordering::SeqCst) != 0 {
+        // FIXME add a sleep here when it doesn't involve timers
+    }
 
     unsafe {
-        assert_eq!(libc::atexit(shutdown), 0);
-    }
-    return Ok(());
-
-    extern fn shutdown() {
-        // Set to INITIALIZING to prevent re-initialization after
-        let logger = LOGGER.swap(INITIALIZING, Ordering::SeqCst);
-
-        while REFCOUNT.load(Ordering::SeqCst) != 0 {
-            // FIXME add a sleep here when it doesn't involve timers
-        }
-
-        unsafe { mem::transmute::<usize, Box<Box<Log>>>(logger); }
+        let logger = LOGGER;
+        LOGGER = &NopLogger;
+        Ok(logger)
     }
 }
 
@@ -616,11 +760,73 @@ impl fmt::Display for SetLoggerError {
     }
 }
 
+// The Error trait is not available in libcore
+#[cfg(feature = "use_std")]
 impl error::Error for SetLoggerError {
     fn description(&self) -> &str { "set_logger() called multiple times" }
 }
 
-struct LoggerGuard(usize);
+/// The type returned by `shutdown_logger_raw` if `shutdown_logger_raw` has
+/// already been called or if `set_logger_raw` has not been called yet.
+#[allow(missing_copy_implementations)]
+#[derive(Debug)]
+pub struct ShutdownLoggerError(());
+
+impl fmt::Display for ShutdownLoggerError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "attempted to shut down a logger without an active logger")
+    }
+}
+
+// The Error trait is not available in libcore
+#[cfg(feature = "use_std")]
+impl error::Error for ShutdownLoggerError {
+    fn description(&self) -> &str { "shutdown_logger_raw() called without an active logger" }
+}
+
+/// Registers a panic handler which logs at the error level.
+///
+/// The format is the same as the default panic handler. The reporting module is
+/// `log::panic`.
+///
+/// Requires the `use_std` (enabled by default) and `nightly` features.
+#[cfg(all(feature = "nightly", feature = "use_std"))]
+pub fn log_panics() {
+    std::panic::set_handler(panic::log);
+}
+
+// inner module so that the reporting module is log::panic instead of log
+#[cfg(all(feature = "nightly", feature = "use_std"))]
+mod panic {
+    use std::panic::PanicInfo;
+    use std::thread;
+
+    pub fn log(info: &PanicInfo) {
+        let thread = thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>");
+
+        let msg = match info.payload().downcast_ref::<&'static str>() {
+            Some(s) => *s,
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => &s[..],
+                None => "Box<Any>",
+            }
+        };
+
+        match info.location() {
+            Some(location) => {
+                error!("thread '{}' panicked at '{}': {}:{}",
+                       thread,
+                       msg,
+                       location.file(),
+                       location.line())
+            }
+            None => error!("thread '{}' panicked at '{}'", thread, msg),
+        }
+    }
+}
+
+struct LoggerGuard(&'static Log);
 
 impl Drop for LoggerGuard {
     fn drop(&mut self) {
@@ -629,21 +835,20 @@ impl Drop for LoggerGuard {
 }
 
 impl Deref for LoggerGuard {
-    type Target = Box<Log>;
+    type Target = Log;
 
-    fn deref(&self) -> &Box<Log+'static> {
-        unsafe { mem::transmute(self.0) }
+    fn deref(&self) -> &(Log + 'static) {
+        self.0
     }
 }
 
 fn logger() -> Option<LoggerGuard> {
     REFCOUNT.fetch_add(1, Ordering::SeqCst);
-    let logger = LOGGER.load(Ordering::SeqCst);
-    if logger == UNINITIALIZED || logger == INITIALIZING {
+    if STATE.load(Ordering::SeqCst) != INITIALIZED {
         REFCOUNT.fetch_sub(1, Ordering::SeqCst);
         None
     } else {
-        Some(LoggerGuard(logger))
+        Some(LoggerGuard(unsafe { &*LOGGER }))
     }
 }
 
@@ -678,10 +883,48 @@ pub fn __log(level: LogLevel, target: &str, loc: &LogLocation,
     }
 }
 
+// WARNING
+// This is not considered part of the crate's public API. It is subject to
+// change at any time.
+#[inline(always)]
+#[doc(hidden)]
+pub fn __static_max_level() -> LogLevelFilter {
+    if !cfg!(debug_assertions) {
+        // This is a release build. Check `release_max_level_*` first.
+        if cfg!(feature = "release_max_level_off") {
+            return LogLevelFilter::Off
+        } else if cfg!(feature = "release_max_level_error") {
+            return LogLevelFilter::Error
+        } else if cfg!(feature = "release_max_level_warn") {
+            return LogLevelFilter::Warn
+        } else if cfg!(feature = "release_max_level_info") {
+            return LogLevelFilter::Info
+        } else if cfg!(feature = "release_max_level_debug") {
+            return LogLevelFilter::Debug
+        } else if cfg!(feature = "release_max_level_trace") {
+            return LogLevelFilter::Trace
+        }
+    }
+    if cfg!(feature = "max_level_off") {
+        LogLevelFilter::Off
+    } else if cfg!(feature = "max_level_error") {
+        LogLevelFilter::Error
+    } else if cfg!(feature = "max_level_warn") {
+        LogLevelFilter::Warn
+    } else if cfg!(feature = "max_level_info") {
+        LogLevelFilter::Info
+    } else if cfg!(feature = "max_level_debug") {
+        LogLevelFilter::Debug
+    } else {
+        LogLevelFilter::Trace
+    }
+}
+
 #[cfg(test)]
 mod tests {
-     use std::error::Error;
-     use super::{LogLevel, LogLevelFilter, SetLoggerError};
+     extern crate std;
+     use tests::std::string::ToString;
+     use super::{LogLevel, LogLevelFilter};
 
      #[test]
      fn test_loglevelfilter_from_str() {
@@ -766,7 +1009,10 @@ mod tests {
      }
 
      #[test]
+     #[cfg(feature = "use_std")]
      fn test_error_trait() {
+         use std::error::Error;
+         use super::SetLoggerError;
          let e = SetLoggerError(());
          assert_eq!(e.description(), "set_logger() called multiple times");
      }
